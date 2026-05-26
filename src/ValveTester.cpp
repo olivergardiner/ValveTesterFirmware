@@ -5,22 +5,7 @@
 
 #include "hardware.h"
 
-enum
-{
-    ERR_NO_ERROR,
-    ERR_INVALID_INFO,
-    ERR_INVALID_MODE,
-    ERR_INVALID_SET,
-    ERR_INVALID_GET,
-    ERR_I2C,
-    ERR_GRID_RANGE,
-    ERR_HT_RANGE,
-    ERR_HT_TIMEOUT,
-    ERR_UNSAFE,
-    ERR_OFFSET_RANGE
-};
-
-const char *errorMessages[] = {
+const char *const ValveTester::errorMessages[ValveTester::ERR_COUNT] = {
     "",
     "Invalid info command",
     "Invalid mode command",
@@ -31,7 +16,8 @@ const char *errorMessages[] = {
     "HT voltage out of range",
     "Timeout setting HT voltage",
     "Unsafe to test",
-    "Offset voltage out of range"};
+    "Offset voltage out of range",
+};
 
 ValveTester::ValveTester()
     : parser(this, &ValveTester::infoCommand, &ValveTester::modeCommand,
@@ -42,6 +28,12 @@ ValveTester::ValveTester()
       currentLo2(0), currentMid2(0), currentHi2(0)
 {
     Wire.begin(MASTER_ADDR);
+    pinMode(CHARGE1_PIN,    OUTPUT); digitalWrite(CHARGE1_PIN,    LOW);
+    pinMode(CHARGE2_PIN,    OUTPUT); digitalWrite(CHARGE2_PIN,    LOW);
+    pinMode(DISCHARGE1_PIN, OUTPUT); digitalWrite(DISCHARGE1_PIN, LOW);
+    pinMode(DISCHARGE2_PIN, OUTPUT); digitalWrite(DISCHARGE2_PIN, LOW);
+    pinMode(FIRE1_PIN,      OUTPUT); digitalWrite(FIRE1_PIN,      LOW);
+    pinMode(FIRE2_PIN,      OUTPUT); digitalWrite(FIRE2_PIN,      LOW);
 }
 
 void ValveTester::parseInput(char c)
@@ -80,6 +72,20 @@ void ValveTester::printValues()
 
 int ValveTester::measureValues()
 {
+    measuredHT1 = analogRead(VA1_PIN);
+    measuredHT2 = analogRead(VA2_PIN);
+    currentLo1  = analogRead(IA1_LO_PIN);
+    currentMid1 = analogRead(IA1_MID_PIN);
+    currentLo2  = analogRead(IA2_LO_PIN);
+    currentMid2 = analogRead(IA2_MID_PIN);
+#if HARDWARE_TYPE == MEGA2560
+    currentHi1 = analogRead(IA1_HI_PIN);
+    currentHi2 = analogRead(IA2_HI_PIN);
+#else
+    currentHi1 = 0;
+    currentHi2 = 0;
+#endif
+
     return 1;
 }
 
@@ -87,29 +93,140 @@ int ValveTester::runTest()
 {
     int status;
 
-    applyGridVoltage(grid1, DAC1_ADDR);
-    applyGridVoltage(grid2, DAC2_ADDR);
-
     status = chargeHT();
+
     if (status > 0)
     {
+        digitalWrite(FIRE1_PIN, HIGH);
+        digitalWrite(FIRE2_PIN, HIGH);
+
+        delayMicroseconds(1); // Allow some time for voltages and currents to stabilise before measuring
         status = measureValues();
+
+        digitalWrite(FIRE1_PIN, LOW);
+        digitalWrite(FIRE2_PIN, LOW);
     }
 
     return status;
 }
 
+// Voltage sense: 3×470kΩ top, 2×4.7kΩ bottom, Vref=4.096V, 10-bit ADC
+// V_cap = count × (4.096/1024) × (1419400/9400) = count × 0.604 V/count
+// Resistor power P = (dV_count × 0.604)² / 1000 W
+// 2.5W limit → dV_count ≤ √(2500) / 0.604 ≈ 82 counts (≈50V) – full drive safe below this
+// Software PWM: both channels pulsed simultaneously within one HT_PERIOD_US window.
+// On-time t_on (µs) = P_limit × R × HT_PERIOD_US / V² = HT_ON_NUMERATOR / dV_count²
+static const uint16_t      HT_PERIOD_US         = 2000;      // PWM period (µs); << τ = RC = 100ms
+static const long          HT_ON_NUMERATOR      = 13706000L; // = 2.5 × 1000 × HT_PERIOD_US / 0.604²
+static const int           HT_SAFE_DV_COUNTS    = 82;        // below this dV full drive is safe
+static const int           HT_DISCHARGED_COUNTS = 5;         // ≈3V – considered safely discharged
+static const unsigned long HT_TIMEOUT_MS        = 30000UL;   // 30 s max per charge/discharge
+
+// Return on-time (µs) that keeps average resistor power ≤ 2.5 W over one PWM period
+static uint16_t htOnTime(int dv)
+{
+    if (dv <= HT_SAFE_DV_COUNTS)
+        return HT_PERIOD_US;
+    long t = HT_ON_NUMERATOR / ((long)dv * dv);
+    return (t >= HT_PERIOD_US) ? HT_PERIOD_US : (uint16_t)t;
+}
+
+// Pulse two pins simultaneously with independent on-times inside one PWM period.
+// The pin with the shorter on-time is turned off first; both are LOW by the end of the period.
+static void htPulse(uint8_t pin1, uint16_t on1, uint8_t pin2, uint16_t on2)
+{
+    if (on1) digitalWrite(pin1, HIGH);
+    if (on2) digitalWrite(pin2, HIGH);
+
+    uint16_t t_a = (on1 <= on2) ? on1 : on2;   // earlier turn-off time
+    uint16_t t_b = (on1 <= on2) ? on2 : on1;   // later  turn-off time
+    uint8_t  pa  = (on1 <= on2) ? pin1 : pin2;  // pin that turns off first
+    uint8_t  pb  = (on1 <= on2) ? pin2 : pin1;  // pin that turns off second
+
+    if (t_a)                 delayMicroseconds(t_a);
+    digitalWrite(pa, LOW);
+    if (t_b > t_a)           delayMicroseconds(t_b - t_a);
+    digitalWrite(pb, LOW);
+    if (HT_PERIOD_US > t_b)  delayMicroseconds(HT_PERIOD_US - t_b);
+}
+
 int ValveTester::chargeHT()
 {
+    unsigned long start = millis();
+    bool done1 = (targetHT1 == 0);
+    bool done2 = (targetHT2 == 0);
+
+    digitalWrite(CHARGE1_PIN, LOW);
+    digitalWrite(CHARGE2_PIN, LOW);
+
+    while (!done1 || !done2)
+    {
+        if (millis() - start > HT_TIMEOUT_MS)
+        {
+            digitalWrite(CHARGE1_PIN, LOW);
+            digitalWrite(CHARGE2_PIN, LOW);
+            return -ERR_HT_TIMEOUT;
+        }
+
+        uint16_t on1 = 0, on2 = 0;
+
+        if (!done1)
+        {
+            int m = analogRead(VA1_PIN);
+            if (m >= targetHT1) done1 = true;
+            else                on1 = htOnTime(targetHT1 - m);
+        }
+
+        if (!done2)
+        {
+            int m = analogRead(VA2_PIN);
+            if (m >= targetHT2) done2 = true;
+            else                on2 = htOnTime(targetHT2 - m);
+        }
+
+        if (on1 || on2)
+            htPulse(CHARGE1_PIN, on1, CHARGE2_PIN, on2);
+    }
+
     return 1;
 }
 
 int ValveTester::dischargeHT()
 {
-    return 1;
+    unsigned long start = millis();
+
+    digitalWrite(DISCHARGE1_PIN, LOW);
+    digitalWrite(DISCHARGE2_PIN, LOW);
+
+    for (;;)
+    {
+        if (millis() - start > HT_TIMEOUT_MS)
+        {
+            digitalWrite(DISCHARGE1_PIN, LOW);
+            digitalWrite(DISCHARGE2_PIN, LOW);
+            return -ERR_HT_TIMEOUT;
+        }
+
+        int  m1    = analogRead(VA1_PIN);
+        int  m2    = analogRead(VA2_PIN);
+        bool done1 = (m1 <= HT_DISCHARGED_COUNTS);
+        bool done2 = (m2 <= HT_DISCHARGED_COUNTS);
+
+        if (done1 && done2)
+        {
+            digitalWrite(DISCHARGE1_PIN, LOW);
+            digitalWrite(DISCHARGE2_PIN, LOW);
+            return 1;
+        }
+
+        uint16_t on1 = done1 ? 0 : htOnTime(m1);
+        uint16_t on2 = done2 ? 0 : htOnTime(m2);
+
+        htPulse(DISCHARGE1_PIN, on1, DISCHARGE2_PIN, on2);
+    }
 }
 
-int ValveTester::applyGridVoltage(int value, int address)
+int ValveTester::applyGridVoltage(int value, uint8_t address)
 {
     byte buf[3];
 

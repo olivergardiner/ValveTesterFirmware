@@ -8,26 +8,16 @@
 #define DAC2_ADDR 0x61   // I2C Address of other MCP4725; its pin A0 must be pulled HIGH to make address 0x61 (also remove pull-up resistors). Note that the breakout board uses the MCP4725A0.
 // NB: I2C can send 32 ints per transmission.
 
-#define SET_GRID1      0
-#define SET_GRID2      1
-#define SET_TARGET_HT1 2
-#define SET_TARGET_HT2 3
-
-#define GET_ALL_VALUES 0
-
-#define INFO_HW_VERSION 0
-#define INFO_SW_VERSION 1
-
-#define MODE_SAFE      0
-#define MODE_RUN_TEST  1
-#define MODE_DISCHARGE 2
-#define MODE_CHARGE    3
-
 class ValveTester
 {
 public:
     ValveTester();
     void parseInput(char c);
+
+    enum SetIndex  { SET_GRID1 = 0, SET_GRID2, SET_TARGET_HT1, SET_TARGET_HT2 };
+    enum GetIndex  { GET_ALL_VALUES = 0 };
+    enum InfoIndex { INFO_HW_VERSION = 0, INFO_SW_VERSION };
+    enum ModeIndex { MODE_SAFE = 0, MODE_RUN_TEST, MODE_DISCHARGE, MODE_CHARGE };
 
     // Setters for target values
     void setGrid1(int value)     { grid1 = value; }
@@ -52,6 +42,23 @@ public:
     int getCurrentHi2() const       { return currentHi2; }
 
 protected:
+    enum ErrorCode {
+        ERR_NO_ERROR = 0,
+        ERR_INVALID_INFO,
+        ERR_INVALID_MODE,
+        ERR_INVALID_SET,
+        ERR_INVALID_GET,
+        ERR_I2C,
+        ERR_GRID_RANGE,
+        ERR_HT_RANGE,
+        ERR_HT_TIMEOUT,
+        ERR_UNSAFE,
+        ERR_OFFSET_RANGE,
+        ERR_COUNT  // must remain last
+    };
+
+    static const char *const errorMessages[ERR_COUNT];
+
     CommandParser<ValveTester> parser;
 
     // Target values
@@ -76,12 +83,16 @@ protected:
     virtual void setCommand(int index, int value);
     virtual void commandError(const char *command);
 
+    // Column order: grid1, grid2, targetHT1, targetHT2,
+    //               measuredHT1, measuredHT2,
+    //               currentLo1, currentMid1, currentHi1,
+    //               currentLo2, currentMid2, currentHi2
     void printValues();
     virtual int runTest();
     virtual int measureValues();
     virtual int chargeHT();
     virtual int dischargeHT();
-    virtual int applyGridVoltage(int value, int address);
+    virtual int applyGridVoltage(int value, uint8_t address);
 };
 
 #endif // VALVE_TESTER_H
