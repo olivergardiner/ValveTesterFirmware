@@ -22,7 +22,7 @@ const char *const ValveTester::errorMessages[ValveTester::ERR_COUNT] = {
 ValveTester::ValveTester()
     : parser(this, &ValveTester::infoCommand, &ValveTester::modeCommand,
              &ValveTester::getCommand, &ValveTester::setCommand, &ValveTester::commandError),
-      grid1(0), grid2(0), targetHT1(0), targetHT2(0),
+      grid1(0), grid2(0), targetHT1(0), targetHT2(0), testMode(TEST_MODE_OFF),
       measuredHT1(0), measuredHT2(0),
       currentLo1(0), currentMid1(0), currentHi1(0),
       currentLo2(0), currentMid2(0), currentHi2(0)
@@ -70,8 +70,37 @@ void ValveTester::printValues()
     Serial.println(currentHi2);
 }
 
+// Nominal simulated ADC counts for each test-mode valve type.
+// ECC83: low-current dual triode (~1.2 mA/triode). Both channels active.
+// EL84:  higher-current pentode (~48 mA). Channel 1 only; channel 2 idle.
+static const int SIM_ECC83_LO  =   5;
+static const int SIM_ECC83_MID =  50;
+static const int SIM_ECC83_HI  = 200;
+static const int SIM_EL84_LO   = 400;
+static const int SIM_EL84_MID  = 800;
+static const int SIM_EL84_HI   = 1023;
+
 int ValveTester::measureValues()
 {
+    if (testMode == TEST_MODE_ECC83)
+    {
+        // Simulate ECC83: both triodes produce identical plausible readings
+        measuredHT1 = targetHT1;
+        measuredHT2 = targetHT2;
+        currentLo1  = SIM_ECC83_LO;  currentMid1 = SIM_ECC83_MID;  currentHi1 = SIM_ECC83_HI;
+        currentLo2  = SIM_ECC83_LO;  currentMid2 = SIM_ECC83_MID;  currentHi2 = SIM_ECC83_HI;
+        return 1;
+    }
+    if (testMode == TEST_MODE_EL84)
+    {
+        // Simulate EL84: single device on channel 1; channel 2 idle
+        measuredHT1 = targetHT1;
+        measuredHT2 = 0;
+        currentLo1  = SIM_EL84_LO;  currentMid1 = SIM_EL84_MID;  currentHi1 = SIM_EL84_HI;
+        currentLo2  = 0;            currentMid2 = 0;               currentHi2 = 0;
+        return 1;
+    }
+
     measuredHT1 = analogRead(VA1_PIN);
     measuredHT2 = analogRead(VA2_PIN);
     currentLo1  = analogRead(IA1_LO_PIN);
@@ -93,6 +122,12 @@ int ValveTester::runTest()
 {
     int status;
 
+    if (testMode != TEST_MODE_OFF)
+    {
+        // Test mode: skip all hardware and return simulated measurements
+        return measureValues();
+    }
+
     status = chargeHT();
 
     if (status > 0)
@@ -100,7 +135,7 @@ int ValveTester::runTest()
         digitalWrite(FIRE1_PIN, HIGH);
         digitalWrite(FIRE2_PIN, HIGH);
 
-        delayMicroseconds(1); // Allow some time for voltages and currents to stabilise before measuring
+        delayMicroseconds(10); // Allow some time for voltages and currents to stabilise before measuring
         status = measureValues();
 
         digitalWrite(FIRE1_PIN, LOW);
@@ -253,7 +288,11 @@ void ValveTester::infoCommand(int index)
     switch (index)
     {
     case INFO_HW_VERSION:
+#if HARDWARE_TYPE == MEGA2560
         Serial.println("OK: Info(0) = Rev 5 (Mega Pro)");
+#elif HARDWARE_TYPE == NANO
+        Serial.println("OK: Info(0) = Rev 6 (Valve Wizard Nano mkII)");
+#endif
         break;
     case INFO_SW_VERSION:
         Serial.println("OK: Info(1) = 2.0.0");
@@ -399,6 +438,16 @@ void ValveTester::setCommand(int index, int value)
         else
         {
             targetHT2 = value;
+        }
+        break;
+    case SET_TEST_MODE:
+        if (value < TEST_MODE_OFF || value > TEST_MODE_EL84)
+        {
+            success = -ERR_INVALID_SET;
+        }
+        else
+        {
+            testMode = value;
         }
         break;
     default:

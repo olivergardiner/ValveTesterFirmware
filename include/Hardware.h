@@ -1,3 +1,6 @@
+#define MEGA2560 1
+#define NANO     2
+
 #define HARDWARE_TYPE MEGA2560
 
 #if HARDWARE_TYPE == MEGA2560

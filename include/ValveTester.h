@@ -14,22 +14,25 @@ public:
     ValveTester();
     void parseInput(char c);
 
-    enum SetIndex  { SET_GRID1 = 0, SET_GRID2, SET_TARGET_HT1, SET_TARGET_HT2 };
+    enum SetIndex  { SET_GRID1 = 0, SET_GRID2, SET_TARGET_HT1, SET_TARGET_HT2, SET_TEST_MODE };
     enum GetIndex  { GET_ALL_VALUES = 0 };
     enum InfoIndex { INFO_HW_VERSION = 0, INFO_SW_VERSION };
     enum ModeIndex { MODE_SAFE = 0, MODE_RUN_TEST, MODE_DISCHARGE, MODE_CHARGE };
+    enum TestModeIndex { TEST_MODE_OFF = 0, TEST_MODE_ECC83 = 1, TEST_MODE_EL84 = 2 };
 
     // Setters for target values
     void setGrid1(int value)     { grid1 = value; }
     void setGrid2(int value)     { grid2 = value; }
     void setTargetHT1(int value) { targetHT1 = value; }
     void setTargetHT2(int value) { targetHT2 = value; }
+    void setTestMode(int value)  { testMode = value; }
 
     // Getters for target values
     int getGrid1() const    { return grid1; }
     int getGrid2() const    { return grid2; }
     int getTargetHT1() const { return targetHT1; }
     int getTargetHT2() const { return targetHT2; }
+    int getTestMode() const  { return testMode; }
 
     // Getters for measured values
     int getMeasuredHT1() const      { return measuredHT1; }
@@ -66,6 +69,7 @@ protected:
     int grid2;
     int targetHT1;
     int targetHT2;
+    int testMode;
 
     // Measured values
     int measuredHT1;
