@@ -1,6 +1,7 @@
 #include "ValveTester.h"
 
 #include "Arduino.h"
+#include <math.h>
 #include "Wire.h"
 
 #include "hardware.h"
@@ -70,34 +71,145 @@ void ValveTester::printValues()
     Serial.println(currentHi2);
 }
 
-// Nominal simulated ADC counts for each test-mode valve type.
-// ECC83: low-current dual triode (~1.2 mA/triode). Both channels active.
-// EL84:  higher-current pentode (~48 mA). Channel 1 only; channel 2 idle.
-static const int SIM_ECC83_LO  =   5;
-static const int SIM_ECC83_MID =  50;
-static const int SIM_ECC83_HI  = 200;
-static const int SIM_EL84_LO   = 400;
-static const int SIM_EL84_MID  = 800;
-static const int SIM_EL84_HI   = 1023;
+// ─── Valve model helpers (equations ported from valvedesigner-web/public/designer.js) ────
+// All currents in mA; voltages in V.
+
+// Numerically stable log(1 + exp(y)); prevents float overflow for large y.
+static float softplus(float y)
+{
+    return (y > 70.0f) ? y : logf(1.0f + expf(y));
+}
+
+// ── ECC83 "12AX7 (Cohen Helie - DS)" parameters ──────────────────────────────
+static const float ECC83_KG1  = 0.899682f;
+static const float ECC83_MU   = 100.0f;
+static const float ECC83_X    = 1.52f;
+static const float ECC83_KP   = 806.0f;
+static const float ECC83_KVB  = 3.0f;
+static const float ECC83_KVB1 = 12.5f;
+static const float ECC83_VCT  = 0.505f;
+
+// Cohen-Helie triode model. vg1 = actual (negative) grid voltage. Returns Ia in mA.
+static float cohenHelieTriode_mA(float va, float vg1)
+{
+    float f  = sqrtf(ECC83_KVB + va * ECC83_KVB1 + va * va);
+    float y  = ECC83_KP * (1.0f / ECC83_MU + (vg1 + ECC83_VCT) / f);
+    float ep = va / ECC83_KP * softplus(y);
+    if (ep <= 0.0f) return 0.0f;
+    // ia [A] = epk / (kg1 * 1000);  multiply by 1000 gives mA = epk / kg1
+    return powf(ep, ECC83_X) / ECC83_KG1;
+}
+
+// ── EL84 "EL84 (Simple)" parameters ─────────────────────────────────────────
+static const float EL84_A     = 0.00010564f;
+static const float EL84_ALPHA = 0.007691f;
+static const float EL84_BETA  = 0.037742f;
+static const float EL84_GAMMA = 0.674046f;
+static const float EL84_KG1   = 0.279261f;
+static const float EL84_KG2   = 2.614896f;
+static const float EL84_KP    = 145.4f;
+static const float EL84_MU    = 19.0f;
+
+// Simple pentode epk helper (shared by Ia and Ig2 calculations).
+static float el84Epk(float vg2, float vg1)
+{
+    if (vg2 <= 0.0f) return 0.0f;
+    float y  = EL84_KP * (1.0f / EL84_MU + vg1 / vg2);
+    float ep = vg2 / EL84_KP * softplus(y);
+    return (ep > 0.0f) ? powf(ep, 1.5f) : 0.0f;
+}
+
+// Simple pentode anode current (mA). vg1: control grid (negative); vg2: screen (positive).
+static float el84Anode_mA(float va, float vg1, float vg2)
+{
+    float epk   = el84Epk(vg2, vg1);
+    float k     = 1.0f / EL84_KG1 - 1.0f / EL84_KG2;
+    float shift = EL84_BETA * (1.0f - EL84_ALPHA * vg1);
+    float sv    = shift * va;
+    float g     = (sv > 0.0f) ? expf(-powf(sv, EL84_GAMMA)) : 1.0f;
+    float ia    = epk * (k * (1.0f - g) + EL84_A * va / EL84_KG1);
+    return (ia > 0.0f) ? ia : 0.0f;
+}
+
+// Simple pentode screen current (mA).
+static float el84Screen_mA(float va, float vg1, float vg2)
+{
+    float epk   = el84Epk(vg2, vg1);
+    float shift = EL84_BETA * (1.0f - EL84_ALPHA * vg1);
+    float sv    = shift * va;
+    float g     = (sv > 0.0f) ? expf(-powf(sv, EL84_GAMMA)) : 1.0f;
+    float psi   = EL84_KG2 / EL84_KG1 - 1.0f;
+    float ig2   = epk * (1.0f + psi * g - EL84_A * va) / EL84_KG2;
+    return (ig2 > 0.0f) ? ig2 : 0.0f;
+}
+
+// ── ADC conversion helpers ────────────────────────────────────────────────────
+// Rsense_med = 100/3 Ω, gain_hi = 4, Rsense_lo = 10/3 Ω, Vref = 4.096 V, 10-bit ADC.
+// Hi:  33.33 counts/mA   Mid:  8.33 counts/mA   Lo:  0.833 counts/mA
+static int mAtoHiCount(float iaMa)
+{
+#if HARDWARE_TYPE == NANO
+    (void)iaMa;
+    return 1023;  // Nano has no hi-sensitivity current sense channel
+#else
+    int c = (int)(iaMa * (100.0f / 3.0f) + 0.5f);
+    return (c < 1023) ? c : 1023;
+#endif
+}
+static int mAtoMidCount(float iaMa)
+{
+    int c = (int)(iaMa * (25.0f / 3.0f) + 0.5f);
+    return (c < 1023) ? c : 1023;
+}
+static int mAtoLoCount(float iaMa)
+{
+    int c = (int)(iaMa * (5.0f / 6.0f) + 0.5f);
+    return (c < 1023) ? c : 1023;
+}
+
+// HT ADC count → voltage (V): Vref/1024 × (R_top + R_bot)/R_bot
+// R_top = 3×470 kΩ = 1 410 000 Ω; R_bot = 2×4.7 kΩ = 9 400 Ω
+static float htCountToVolts(int count)
+{
+    return (float)count * (4.096f / 1024.0f) * (1419400.0f / 9400.0f);
+}
+
+// DAC code → actual (negative) grid voltage: −(code / 4095) × Vref × gain
+// Vref = 4.096 V, inverting gain magnitude = 16.5
+static float dacToGridVolts(int code)
+{
+    return -(float)code * (4.096f * 16.5f / 4095.0f);
+}
 
 int ValveTester::measureValues()
 {
     if (testMode == TEST_MODE_ECC83)
     {
-        // Simulate ECC83: both triodes produce identical plausible readings
-        measuredHT1 = targetHT1;
-        measuredHT2 = targetHT2;
-        currentLo1  = SIM_ECC83_LO;  currentMid1 = SIM_ECC83_MID;  currentHi1 = SIM_ECC83_HI;
-        currentLo2  = SIM_ECC83_LO;  currentMid2 = SIM_ECC83_MID;  currentHi2 = SIM_ECC83_HI;
+        // ECC83 "12AX7 (Cohen Helie - DS)": ch1 and ch2 are independent triodes.
+        // Inputs: targetHT1/HT2 = anode voltage; grid1/grid2 = control grid DAC code.
+        float va1 = htCountToVolts(targetHT1);
+        float vg1 = dacToGridVolts(grid1);
+        float va2 = htCountToVolts(targetHT2);
+        float vg2 = dacToGridVolts(grid2);
+        measuredHT1 = targetHT1;  measuredHT2 = targetHT2;
+        float ia1 = cohenHelieTriode_mA(va1, vg1);
+        float ia2 = cohenHelieTriode_mA(va2, vg2);
+        currentHi1 = mAtoHiCount(ia1);   currentMid1 = mAtoMidCount(ia1);  currentLo1 = mAtoLoCount(ia1);
+        currentHi2 = mAtoHiCount(ia2);   currentMid2 = mAtoMidCount(ia2);  currentLo2 = mAtoLoCount(ia2);
         return 1;
     }
     if (testMode == TEST_MODE_EL84)
     {
-        // Simulate EL84: single device on channel 1; channel 2 idle
-        measuredHT1 = targetHT1;
-        measuredHT2 = 0;
-        currentLo1  = SIM_EL84_LO;  currentMid1 = SIM_EL84_MID;  currentHi1 = SIM_EL84_HI;
-        currentLo2  = 0;            currentMid2 = 0;               currentHi2 = 0;
+        // EL84 "EL84 (Simple)": anode on ch1, screen grid current on ch2.
+        // Inputs: targetHT1 = anode voltage; targetHT2 = screen voltage; grid1 = control grid DAC code.
+        float va  = htCountToVolts(targetHT1);
+        float vg2 = htCountToVolts(targetHT2);  // screen voltage (positive)
+        float vg1 = dacToGridVolts(grid1);       // control grid voltage (negative)
+        measuredHT1 = targetHT1;  measuredHT2 = targetHT2;
+        float ia  = el84Anode_mA(va, vg1, vg2);
+        float ig2 = el84Screen_mA(va, vg1, vg2);
+        currentHi1 = mAtoHiCount(ia);    currentMid1 = mAtoMidCount(ia);   currentLo1 = mAtoLoCount(ia);
+        currentHi2 = mAtoHiCount(ig2);   currentMid2 = mAtoMidCount(ig2);  currentLo2 = mAtoLoCount(ig2);
         return 1;
     }
 
@@ -111,8 +223,8 @@ int ValveTester::measureValues()
     currentHi1 = analogRead(IA1_HI_PIN);
     currentHi2 = analogRead(IA2_HI_PIN);
 #else
-    currentHi1 = 0;
-    currentHi2 = 0;
+    currentHi1 = 1023; // On Nano, IA1_HI and IA2_HI are not connected; return max count to indicate 'over-range'
+    currentHi2 = 1023;
 #endif
 
     return 1;
@@ -291,7 +403,7 @@ void ValveTester::infoCommand(int index)
 #if HARDWARE_TYPE == MEGA2560
         Serial.println("OK: Info(0) = Rev 5 (Mega Pro)");
 #elif HARDWARE_TYPE == NANO
-        Serial.println("OK: Info(0) = Rev 6 (Valve Wizard Nano mkII)");
+        Serial.println("OK: Info(0) = Rev 6 (Valve Wizard Nano MkII)");
 #endif
         break;
     case INFO_SW_VERSION:
