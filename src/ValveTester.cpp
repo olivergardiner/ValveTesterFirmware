@@ -90,10 +90,10 @@ static const float ECC83_KVB1 = 12.5f;
 static const float ECC83_VCT  = 0.505f;
 
 // Cohen-Helie triode model. vg1 = actual (negative) grid voltage. Returns Ia in mA.
-static float cohenHelieTriode_mA(float va, float vg1)
+static float cohenHelieTriode_mA(float va, float vg1, float mu = ECC83_MU)
 {
     float f  = sqrtf(ECC83_KVB + va * ECC83_KVB1 + va * va);
-    float y  = ECC83_KP * (1.0f / ECC83_MU + (vg1 + ECC83_VCT) / f);
+    float y  = ECC83_KP * (1.0f / mu + (vg1 + ECC83_VCT) / f);
     float ep = va / ECC83_KP * softplus(y);
     if (ep <= 0.0f) return 0.0f;
     // ia [A] = epk / (kg1 * 1000);  multiply by 1000 gives mA = epk / kg1
@@ -193,7 +193,7 @@ int ValveTester::measureValues()
         float vg2 = dacToGridVolts(grid2);
         measuredHT1 = targetHT1;  measuredHT2 = targetHT2;
         float ia1 = cohenHelieTriode_mA(va1, vg1);
-        float ia2 = cohenHelieTriode_mA(va2, vg2);
+        float ia2 = cohenHelieTriode_mA(va2, vg2, ECC83_MU - 2.0f);
         currentHi1 = mAtoHiCount(ia1);   currentMid1 = mAtoMidCount(ia1);  currentLo1 = mAtoLoCount(ia1);
         currentHi2 = mAtoHiCount(ia2);   currentMid2 = mAtoMidCount(ia2);  currentLo2 = mAtoLoCount(ia2);
         return 1;
@@ -236,7 +236,12 @@ int ValveTester::runTest()
 
     if (testMode != TEST_MODE_OFF)
     {
-        // Test mode: skip all hardware and return simulated measurements
+        // Test mode: simulate charge time then return simulated measurements.
+        // Approximation: τ = RC = 100 ms; at full duty each 2 ms period closes ~2% of
+        // remaining gap, giving a charge time roughly proportional to the target voltage.
+        // delay_ms ≈ max(targetHT1, targetHT2) / 4  →  ~100 ms at 250 V (414 counts).
+        int maxHT = (targetHT1 > targetHT2) ? targetHT1 : targetHT2;
+        delay(maxHT / 4);
         return measureValues();
     }
 
@@ -428,6 +433,11 @@ void ValveTester::modeCommand(int index)
     switch (index)
     {
     case MODE_SAFE:
+        if (testMode != TEST_MODE_OFF)
+        {
+            Serial.println("OK: Mode(0)");
+            break;
+        }
         success = dischargeHT();
         if (success > 0)
         {
@@ -453,6 +463,11 @@ void ValveTester::modeCommand(int index)
         }
         break;
     case MODE_DISCHARGE:
+        if (testMode != TEST_MODE_OFF)
+        {
+            Serial.println("OK: Mode(2)");
+            break;
+        }
         success = dischargeHT();
         if (success > 0)
         {
