@@ -35,6 +35,17 @@ ValveTester::ValveTester()
     pinMode(DISCHARGE2_PIN, OUTPUT); digitalWrite(DISCHARGE2_PIN, LOW);
     pinMode(FIRE1_PIN,      OUTPUT); digitalWrite(FIRE1_PIN,      LOW);
     pinMode(FIRE2_PIN,      OUTPUT); digitalWrite(FIRE2_PIN,      LOW);
+
+    pinMode(VA1_PIN,    INPUT);
+    pinMode(VA2_PIN,    INPUT);
+    pinMode(IA1_LO_PIN, INPUT);
+    pinMode(IA1_MID_PIN,INPUT);
+    pinMode(IA2_LO_PIN, INPUT);
+    pinMode(IA2_MID_PIN,INPUT);
+#if HARDWARE_TYPE == MEGA2560
+    pinMode(IA1_HI_PIN, INPUT);
+    pinMode(IA2_HI_PIN, INPUT);
+#endif
 }
 
 void ValveTester::parseInput(char c)
@@ -304,6 +315,38 @@ static void htPulse(uint8_t pin1, uint16_t on1, uint8_t pin2, uint16_t on2)
 
 int ValveTester::chargeHT()
 {
+#if ORIGINAL_CHARGE_MODE
+    // Simple DC on/off routine (Merlin's approach).
+    // Charges channels alternately; no resistor power limiting.
+    digitalWrite(CHARGE1_PIN, LOW);
+    digitalWrite(CHARGE2_PIN, LOW);
+    digitalWrite(DISCHARGE1_PIN, LOW);
+    digitalWrite(DISCHARGE2_PIN, LOW);
+
+    int m1 = analogRead(VA1_PIN);
+    int m2 = analogRead(VA2_PIN);
+    while (m1 != targetHT1 || m2 != targetHT2)
+    {
+        while (m1 < targetHT1)
+        {
+            digitalWrite(CHARGE1_PIN, HIGH);
+            m1 = analogRead(VA1_PIN);
+        }
+        digitalWrite(CHARGE1_PIN, LOW);
+
+        m2 = analogRead(VA2_PIN);
+        while (m2 < targetHT2)
+        {
+            digitalWrite(CHARGE2_PIN, HIGH);
+            m2 = analogRead(VA2_PIN);
+        }
+        digitalWrite(CHARGE2_PIN, LOW);
+
+        m1 = analogRead(VA1_PIN);
+    }
+    return 1;
+#else
+    // PWM-based routine: limits average resistor power to 2.5 W.
     unsigned long start = millis();
     bool done1 = (targetHT1 == 0);
     bool done2 = (targetHT2 == 0);
@@ -341,10 +384,27 @@ int ValveTester::chargeHT()
     }
 
     return 1;
+#endif
 }
 
 int ValveTester::dischargeHT()
 {
+#if ORIGINAL_CHARGE_MODE
+    // Simple DC on/off routine (Merlin's approach).
+    // Turns discharge MOSFETs fully on and waits until current sense reads zero.
+    digitalWrite(FIRE1_PIN,      LOW);
+    digitalWrite(FIRE2_PIN,      LOW);
+    digitalWrite(CHARGE1_PIN,    LOW);
+    digitalWrite(CHARGE2_PIN,    LOW);
+    digitalWrite(DISCHARGE1_PIN, HIGH);
+    digitalWrite(DISCHARGE2_PIN, HIGH);
+    while (analogRead(IA1_LO_PIN)) {}
+    while (analogRead(IA2_LO_PIN)) {}
+    digitalWrite(DISCHARGE1_PIN, LOW);
+    digitalWrite(DISCHARGE2_PIN, LOW);
+    return 1;
+#else
+    // PWM-based routine: limits average resistor power to 2.5 W.
     unsigned long start = millis();
 
     digitalWrite(DISCHARGE1_PIN, LOW);
@@ -376,6 +436,7 @@ int ValveTester::dischargeHT()
 
         htPulse(DISCHARGE1_PIN, on1, DISCHARGE2_PIN, on2);
     }
+#endif
 }
 
 int ValveTester::applyGridVoltage(int value, uint8_t address)

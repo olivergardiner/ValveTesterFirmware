@@ -3,6 +3,11 @@
 
 #define HARDWARE_TYPE MEGA2560
 
+// Set ORIGINAL_CHARGE_MODE to 1 to use the simple DC on/off charge/discharge
+// routines (as in Merlin's ValveAnalyserMkII). Set to 0 to use the PWM-based
+// routines that limit resistor power to 2.5 W average.
+#define ORIGINAL_CHARGE_MODE 0
+
 #if HARDWARE_TYPE == MEGA2560
 
 #define CHARGE1_PIN 6        //Drive to high-voltage charge MOSFET (PWM)
