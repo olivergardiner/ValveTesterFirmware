@@ -316,8 +316,7 @@ static void htPulse(uint8_t pin1, uint16_t on1, uint8_t pin2, uint16_t on2)
 int ValveTester::chargeHT()
 {
 #if ORIGINAL_CHARGE_MODE
-    // Simple DC on/off routine (Merlin's approach).
-    // Charges channels alternately; no resistor power limiting.
+   // Charges channels alternately; no resistor power limiting.
     digitalWrite(CHARGE1_PIN, LOW);
     digitalWrite(CHARGE2_PIN, LOW);
     digitalWrite(DISCHARGE1_PIN, LOW);
@@ -325,6 +324,13 @@ int ValveTester::chargeHT()
 
     int m1 = analogRead(VA1_PIN);
     int m2 = analogRead(VA2_PIN);
+    // TODO: consider changing != to >= (as in the PWM path) to handle overshoot — if the
+    // capacitor charges past targetHT due to MOSFET turn-off latency, m1/m2 will exceed
+    // the target on the first read after the inner while exits, making the != condition
+    // immediately false. That is actually the desired behaviour, but if a subsequent read
+    // returns below target (e.g. due to droop or ADC noise) the outer loop re-enters
+    // unexpectedly. Using >= would make the termination condition consistent with the PWM
+    // path and immune to that edge case.
     while (m1 != targetHT1 || m2 != targetHT2)
     {
         while (m1 < targetHT1)
@@ -390,8 +396,13 @@ int ValveTester::chargeHT()
 int ValveTester::dischargeHT()
 {
 #if ORIGINAL_CHARGE_MODE
-    // Simple DC on/off routine (Merlin's approach).
     // Turns discharge MOSFETs fully on and waits until current sense reads zero.
+    // TODO: this is a potential infinite loop. ADC noise alone (±1–2 counts) or a tiny
+    // residual leakage current through the 3.3 Ω LO sense resistor can keep the ADC
+    // reading non-zero even when the capacitor is effectively discharged. Consider adding
+    // a timeout (e.g. 30 s as in the PWM path) or replacing the current-zero condition
+    // with a voltage-zero condition using VA1_PIN / VA2_PIN and a small threshold (like
+    // HT_DISCHARGED_COUNTS) so the loop exits reliably.
     digitalWrite(FIRE1_PIN,      LOW);
     digitalWrite(FIRE2_PIN,      LOW);
     digitalWrite(CHARGE1_PIN,    LOW);
@@ -449,9 +460,10 @@ int ValveTester::applyGridVoltage(int value, uint8_t address)
     }
 
     Wire.beginTransmission(address);
-    buf[0] = value >> 8;
-    buf[1] = value & 255;
-    Wire.write(buf, 2);
+    buf[0] = 0x40;             // MCP4725 "Write DAC Register" command
+    buf[1] = value >> 4;       // D11–D4
+    buf[2] = (value & 0x0F) << 4; // D3–D0 in upper nibble (lower nibble don't-care)
+    Wire.write(buf, 3);
     if (Wire.endTransmission() != 0)
     { // If I2C tramission failed, return error
         return -ERR_I2C;
@@ -539,7 +551,7 @@ void ValveTester::modeCommand(int index)
         success = chargeHT();
         if (success > 0)
         {
-            Serial.println("OK: Mode(3) ");
+            Serial.println("OK: Mode(3)");
         }
         break;
     default:
